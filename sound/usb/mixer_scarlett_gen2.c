@@ -173,7 +173,7 @@ static const u16 scarlett2_mixer_values[SCARLETT2_MIXER_VALUE_COUNT] = {
 };
 
 /* Maximum number of analogue outputs */
-#define SCARLETT2_ANALOGUE_MAX 10
+#define SCARLETT2_ANALOGUE_OUT_MAX 10
 
 /* Maximum number of level and pad switches */
 #define SCARLETT2_LEVEL_SWITCH_MAX 2
@@ -355,10 +355,10 @@ struct scarlett2_device_info {
 	 * internally to the analogue 7/8 outputs
 	 */
 	u8 line_out_remap_enable;
-	u8 line_out_remap[SCARLETT2_ANALOGUE_MAX];
+	u8 line_out_remap[SCARLETT2_ANALOGUE_OUT_MAX];
 
 	/* additional description for the line out volume controls */
-	const char * const line_out_descrs[SCARLETT2_ANALOGUE_MAX];
+	const char * const line_out_descrs[SCARLETT2_ANALOGUE_OUT_MAX];
 
 	/* number of sources/destinations of each port type */
 	const int port_count[SCARLETT2_PORT_TYPE_COUNT][SCARLETT2_PORT_DIRNS];
@@ -389,9 +389,9 @@ struct scarlett2_data {
 	u8 speaker_switching_switched;
 	u8 sync;
 	u8 master_vol;
-	u8 vol[SCARLETT2_ANALOGUE_MAX];
-	u8 vol_sw_hw_switch[SCARLETT2_ANALOGUE_MAX];
-	u8 mute_switch[SCARLETT2_ANALOGUE_MAX];
+	u8 vol[SCARLETT2_ANALOGUE_OUT_MAX];
+	u8 vol_sw_hw_switch[SCARLETT2_ANALOGUE_OUT_MAX];
+	u8 mute_switch[SCARLETT2_ANALOGUE_OUT_MAX];
 	u8 level_switch[SCARLETT2_LEVEL_SWITCH_MAX];
 	u8 pad_switch[SCARLETT2_PAD_SWITCH_MAX];
 	u8 dim_mute[SCARLETT2_DIM_MUTE_COUNT];
@@ -405,9 +405,9 @@ struct scarlett2_data {
 	u8 msd_switch;
 	struct snd_kcontrol *sync_ctl;
 	struct snd_kcontrol *master_vol_ctl;
-	struct snd_kcontrol *vol_ctls[SCARLETT2_ANALOGUE_MAX];
-	struct snd_kcontrol *sw_hw_ctls[SCARLETT2_ANALOGUE_MAX];
-	struct snd_kcontrol *mute_ctls[SCARLETT2_ANALOGUE_MAX];
+	struct snd_kcontrol *vol_ctls[SCARLETT2_ANALOGUE_OUT_MAX];
+	struct snd_kcontrol *sw_hw_ctls[SCARLETT2_ANALOGUE_OUT_MAX];
+	struct snd_kcontrol *mute_ctls[SCARLETT2_ANALOGUE_OUT_MAX];
 	struct snd_kcontrol *dim_mute_ctls[SCARLETT2_DIM_MUTE_COUNT];
 	struct snd_kcontrol *level_ctls[SCARLETT2_LEVEL_SWITCH_MAX];
 	struct snd_kcontrol *pad_ctls[SCARLETT2_PAD_SWITCH_MAX];
@@ -899,16 +899,16 @@ struct scarlett2_usb_volume_status {
 	u8 pad1;
 
 	/* software volume setting */
-	s16 sw_vol[SCARLETT2_ANALOGUE_MAX];
+	s16 sw_vol[SCARLETT2_ANALOGUE_OUT_MAX];
 
 	/* actual volume of output inc. dim (-18dB) */
-	s16 hw_vol[SCARLETT2_ANALOGUE_MAX];
+	s16 hw_vol[SCARLETT2_ANALOGUE_OUT_MAX];
 
 	/* internal mute buttons */
-	u8 mute_switch[SCARLETT2_ANALOGUE_MAX];
+	u8 mute_switch[SCARLETT2_ANALOGUE_OUT_MAX];
 
 	/* sw (0) or hw (1) controlled */
-	u8 sw_hw_switch[SCARLETT2_ANALOGUE_MAX];
+	u8 sw_hw_switch[SCARLETT2_ANALOGUE_OUT_MAX];
 
 	u8 pad3[6];
 
