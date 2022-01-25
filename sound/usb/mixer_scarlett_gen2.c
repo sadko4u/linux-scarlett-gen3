@@ -2081,7 +2081,8 @@ static int scarlett2_usb_set_mux(struct usb_mixer_interface *mixer)
 	struct scarlett2_data *private = mixer->private_data;
 	const struct scarlett2_device_info *info = private->info;
 	const int (*port_count)[SCARLETT2_PORT_DIRNS] = info->port_count;
-	int table;
+	int i, j, err;
+	int table, port_type, src_id, dst_id, mux_idx;
 
 	struct {
 		__le16 pad;
@@ -2096,8 +2097,7 @@ static int scarlett2_usb_set_mux(struct usb_mixer_interface *mixer)
 		const struct scarlett2_mux_entry *entry;
 
 		/* i counts over the output array */
-		int i = 0, err;
-
+		i = 0;
 		req.num = cpu_to_le16(table);
 		
 		usb_audio_info(mixer->chip, "UPDATING MUX # %d\n", table);
@@ -2106,11 +2106,10 @@ static int scarlett2_usb_set_mux(struct usb_mixer_interface *mixer)
 		for (entry = info->mux_assignment[table];
 		     entry->count;
 		     entry++) {
-			int j;
-			int port_type = entry->port_type;
-			int mux_idx = scarlett2_get_port_start_num(port_count,
+			port_type = entry->port_type;
+			mux_idx = scarlett2_get_port_start_num(port_count,
 				SCARLETT2_PORT_OUT, port_type) + entry->start;
-			int dst_id = scarlett2_ports[port_type].id + entry->start;
+			dst_id = scarlett2_ports[port_type].id + entry->start;
 
 			/* Empty slots */
 			if (!dst_id) {
@@ -2127,8 +2126,9 @@ static int scarlett2_usb_set_mux(struct usb_mixer_interface *mixer)
 			 * the source
 			 */
 			for (j = 0; j < entry->count; j++) {
-				int src_id = scarlett2_mux_src_num_to_id(
-					port_count, private->mux[mux_idx++]);
+				usb_audio_info(mixer->chip, "  type = %d, mux[%d] == %d\n",
+							port_type, mux_idx, private->mux[mux_idx]);
+				src_id = scarlett2_mux_src_num_to_id(port_count, private->mux[mux_idx++]);
 
 				/* Additional functions if software configuration area is present */
 				if (private->sw_cfg != NULL) {
@@ -3955,15 +3955,23 @@ static int scarlett2_mux_src_enum_ctl_get(struct snd_kcontrol *kctl,
 	int line_out_count =
 		port_count[SCARLETT2_PORT_TYPE_ANALOGUE][SCARLETT2_PORT_OUT];
 	int index = elem->control;
-
+	
 	if (index < line_out_count)
 		index = line_out_remap(private, index);
+	
+	usb_audio_info(mixer->chip, ">>>scarlett2_mux_src_enum_ctl_get index=%d\n", index);
 
 	mutex_lock(&private->data_mutex);
 	if (private->mux_updated)
+	{
+		usb_audio_info(mixer->chip, "issuing scarlett2_usb_get_mux");
 		scarlett2_usb_get_mux(mixer);
+	}
 	ucontrol->value.enumerated.item[0] = private->mux[index];
 	mutex_unlock(&private->data_mutex);
+	
+	usb_audio_info(mixer->chip, "<<scarlett2_mux_src_enum_ctl_get index=%d value=%d\n", 
+				   index, ucontrol->value.enumerated.item[0]);
 
 	return 0;
 }
@@ -3989,6 +3997,8 @@ static int scarlett2_mux_src_enum_ctl_put(struct snd_kcontrol *kctl,
 	oval = private->mux[index];
 	val = min(ucontrol->value.enumerated.item[0],
 		  private->num_mux_srcs - 1U);
+	
+	usb_audio_info(mixer->chip, ">>>scarlett2_mux_src_enum_ctl_put index=%d, val=%d oval=%d\n", index, val, oval);
 
 	if (oval == val)
 		goto unlock;
@@ -4013,7 +4023,7 @@ static int scarlett2_mux_src_enum_ctl_put(struct snd_kcontrol *kctl,
 				SCARLETT2_PORT_OUT, drv_port_type, drv_port_number, info);
 		
 		// Obtain the output number
-		usb_audio_info(mixer->chip, "  out_mux[%d] = %d", sw_output_number, sw_input_number);
+		usb_audio_info(mixer->chip, "  sw_cfg->out_mux[%d] = %d", sw_output_number, sw_input_number);
 		if ((sw_output_number >= 0) && (sw_input_number >= 0)) {
 			private->sw_cfg->out_mux[sw_output_number] = sw_input_number;
 			err = scarlett2_commit_software_config(mixer, &private->sw_cfg->out_mux[sw_output_number], sizeof(u8));
@@ -4027,6 +4037,7 @@ static int scarlett2_mux_src_enum_ctl_put(struct snd_kcontrol *kctl,
 
 unlock:
 	mutex_unlock(&private->data_mutex);
+	usb_audio_info(mixer->chip, "<<scarlett2_mux_src_enum_ctl_put\n");
 	return err;
 }
 
@@ -4067,15 +4078,18 @@ static int scarlett2_add_mux_enums(struct usb_mixer_interface *mixer)
 				if (index >= 0) {
 					sw_port_number = private->sw_cfg->out_mux[index];
 					scarlett2_get_sw_to_drv_port_mapping(&drv_port_type, &drv_port_number,
-												  info, SCARLETT2_PORT_IN, sw_port_number);
-					mux_input_number = scarlett2_drv_port_number_to_mux_enum(SCARLETT2_PORT_IN, drv_port_type, drv_port_number, info);
-					
-					usb_audio_info(mixer->chip, "SW ROUTING: %d:%d,%d:%d -> %s (%d,%d)\n",
-								   (int)sw_port_number, drv_port_type, drv_port_number, mux_input_number,
-								   s, port_type, channel
-  								);
+														info, SCARLETT2_PORT_IN, sw_port_number);
+					mux_input_number = scarlett2_drv_port_number_to_mux_enum(
+						SCARLETT2_PORT_IN, drv_port_type, drv_port_number, info);
+				
+					usb_audio_info(mixer->chip, "SW ROUTING for %d: %d:%d,%d:%d -> %s (%d,%d)\n",
+								i, (int)sw_port_number, drv_port_type, drv_port_number, mux_input_number,
+								s, port_type, channel
+								);
 					
 					/* Change the mux settings if they differ from the hardware ones */
+					usb_audio_info(mixer->chip, "mux[%d] = %d -> %d\n",
+								   (int)i, private->mux[i], mux_input_number);
 					if (private->mux[i] != mux_input_number) {
 						private->mux[i] = mux_input_number;
 						mux_updated = 1;
