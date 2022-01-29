@@ -270,6 +270,7 @@ struct scarlett2_port {
 	const char * const src_descr;
 	int src_num_offset;
 	const char * const dst_descr;
+	const char * const dst_stereo_descr;
 };
 
 static const struct scarlett2_port scarlett2_ports[SCARLETT2_PORT_TYPE_COUNT] = {
@@ -281,31 +282,36 @@ static const struct scarlett2_port scarlett2_ports[SCARLETT2_PORT_TYPE_COUNT] = 
 		.id = 0x080,
 		.src_descr = "Analogue %d",
 		.src_num_offset = 1,
-		.dst_descr = "Analogue Output %02d Playback"
+		.dst_descr = "Analogue Output %02d Playback",
+		.dst_stereo_descr = "Analogue Output %02d-%02d"
 	},
 	[SCARLETT2_PORT_TYPE_SPDIF] = {
 		.id = 0x180,
 		.src_descr = "S/PDIF %d",
 		.src_num_offset = 1,
-		.dst_descr = "S/PDIF Output %d Playback"
+		.dst_descr = "S/PDIF Output %d Playback",
+		.dst_stereo_descr = "S/PDIF Output %d-%d"
 	},
 	[SCARLETT2_PORT_TYPE_ADAT] = {
 		.id = 0x200,
 		.src_descr = "ADAT %d",
 		.src_num_offset = 1,
-		.dst_descr = "ADAT Output %d Playback"
+		.dst_descr = "ADAT Output %d Playback",
+		.dst_stereo_descr = "ADAT Output %d-%d"
 	},
 	[SCARLETT2_PORT_TYPE_MIX] = {
 		.id = 0x300,
 		.src_descr = "Mix %c",
 		.src_num_offset = 'A',
-		.dst_descr = "Mixer Input %02d Capture"
+		.dst_descr = "Mixer Input %02d Capture",
+		.dst_stereo_descr = "Mixer Input %02d-%02d"
 	},
 	[SCARLETT2_PORT_TYPE_PCM] = {
 		.id = 0x600,
 		.src_descr = "PCM %d",
 		.src_num_offset = 1,
-		.dst_descr = "PCM %02d Capture"
+		.dst_descr = "PCM %02d Capture",
+		.dst_stereo_descr = "PCM %02d-%02d Capture"
 	},
 };
 
@@ -476,6 +482,7 @@ struct scarlett2_data {
 	u8 vol_sw_hw_switch[SCARLETT2_ANALOGUE_OUT_MAX];
     /* Mute switches for each output including the sofware switches for non-analogue outputs */
 	u8 mute_switch[SCARLETT2_ALL_OUT_MAX];
+	u8 stereo_switch[SCARLETT2_ALL_OUT_MAX >> 1];
 	u8 level_switch[SCARLETT2_LEVEL_SWITCH_MAX];
 	u8 pad_switch[SCARLETT2_PAD_SWITCH_MAX];
 	u8 dim_mute[SCARLETT2_DIM_MUTE_COUNT];
@@ -492,6 +499,7 @@ struct scarlett2_data {
 	struct snd_kcontrol *vol_ctls[SCARLETT2_ANALOGUE_OUT_MAX];
 	struct snd_kcontrol *sw_hw_ctls[SCARLETT2_ANALOGUE_OUT_MAX];
 	struct snd_kcontrol *mute_ctls[SCARLETT2_ALL_OUT_MAX];
+	struct snd_kcontrol *stereo_ctls[SCARLETT2_ALL_OUT_MAX >> 1];
 	struct snd_kcontrol *dim_mute_ctls[SCARLETT2_DIM_MUTE_COUNT];
 	struct snd_kcontrol *level_ctls[SCARLETT2_LEVEL_SWITCH_MAX];
 	struct snd_kcontrol *pad_ctls[SCARLETT2_PAD_SWITCH_MAX];
@@ -1164,11 +1172,32 @@ static char *scarlett2_fmt_port_name(char *out, int length,
 	int printed;
 	const char *const descr = (direction == SCARLETT2_PORT_IN)
 								? scarlett2_ports[port_type].src_descr
-								: scarlett2_ports[port_type].dst_descr;\
+								: scarlett2_ports[port_type].dst_descr;
 	if (postfix != NULL)
 	{
 		postfix_length = strlen(postfix) + 1;
 		printed = snprintf(out, length - postfix_length - 1, descr, port_num + 1);
+		out[printed++] = ' ';
+		memcpy(&out[printed], postfix, postfix_length);
+	}
+	else
+		snprintf(out, length - 1, descr, port_num + 1);
+
+	out[length-1] = '\0';
+	return out;
+}
+
+static char *scarlett2_fmt_stereo_output_port_name(char *out, int length, 
+									 int port_type, int port_num,
+									 const char * const postfix)
+{
+	int postfix_length;
+	int printed;
+	const char *const descr = scarlett2_ports[port_type].dst_stereo_descr;
+	if (postfix != NULL)
+	{
+		postfix_length = strlen(postfix) + 1;
+		printed = snprintf(out, length - postfix_length - 1, descr, port_num + 1, port_num + 2);
 		out[printed++] = ' ';
 		memcpy(&out[printed], postfix, postfix_length);
 	}
@@ -2163,6 +2192,46 @@ static int scarlett2_usb_set_mux(struct usb_mixer_interface *mixer)
 	return 0;
 }
 
+static int scarlett2_mux_commit_route(struct usb_mixer_interface *mixer,
+									  int output_num, int input_number)
+{
+	struct scarlett2_data *private = mixer->private_data;
+	const struct scarlett2_device_info *info = private->info;
+	int err = 0;
+	int drv_port_type, drv_port_number;
+	int sw_input_number, sw_output_number;
+	
+	/* Check that the routing settings have changed */
+	if (private->mux[output_num] == input_number)
+		return 0;
+	
+	private->mux[output_num] = input_number;
+	
+	// Check that software config is present
+	if (private->sw_cfg) {
+		// Obtain the input number
+		scarlett2_mux_enum_to_drv_port_number(&drv_port_type, &drv_port_number,
+								info, SCARLETT2_PORT_IN, input_number);
+		sw_input_number = scarlett2_get_drv_to_sw_port_mapping(
+				SCARLETT2_PORT_IN, drv_port_type, drv_port_number, info);
+		
+		// Obtain the output number
+		scarlett2_mux_enum_to_drv_port_number(&drv_port_type, &drv_port_number,
+								info, SCARLETT2_PORT_OUT, output_num);
+		sw_output_number = scarlett2_get_drv_to_sw_port_mapping(
+				SCARLETT2_PORT_OUT, drv_port_type, drv_port_number, info);
+		
+		// Obtain the output number
+		usb_audio_info(mixer->chip, "  sw_cfg->out_mux[%d] = %d", sw_output_number, sw_input_number);
+		if ((sw_output_number >= 0) && (sw_input_number >= 0)) {
+			private->sw_cfg->out_mux[sw_output_number] = sw_input_number;
+			err = scarlett2_commit_software_config(mixer, &private->sw_cfg->out_mux[sw_output_number], sizeof(u8));
+		}
+	}
+	
+	return err;
+}
+
 /* Send USB message to get meter levels */
 static int scarlett2_usb_get_meter_levels(struct usb_mixer_interface *mixer,
 					  u16 num_meters, u16 *levels)
@@ -2996,6 +3065,137 @@ static const struct snd_kcontrol_new scarlett2_phantom_ctl = {
 	.put  = scarlett2_phantom_ctl_put,
 };
 
+/*** Output Stereo Mode Control ***/
+
+static int scarlett2_stereo_mode_ctl_get(struct snd_kcontrol *kctl,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	struct usb_mixer_elem_info *elem = kctl->private_data;
+	struct usb_mixer_interface *mixer = elem->head.mixer;
+	struct scarlett2_data *private = mixer->private_data;
+	int index = elem->control;
+
+	mutex_lock(&private->data_mutex);
+	ucontrol->value.integer.value[0] = private->stereo_switch[index];
+	mutex_unlock(&private->data_mutex);
+
+	return 0;
+}
+
+static int scarlett2_stereo_mode_ctl_put(struct snd_kcontrol *kctl,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	struct usb_mixer_elem_info *elem = kctl->private_data;
+	struct usb_mixer_interface *mixer = elem->head.mixer;
+	struct scarlett2_data *private = mixer->private_data;
+	struct snd_card *card = mixer->chip->card;
+
+	int index = elem->control;
+	int oval, val, err = 0;
+	int output_number, input_number[2], new_input_number[2];
+	int port_type, port_num, new_port_num[2];
+	u32 mask;
+	
+	mutex_lock(&private->data_mutex);
+
+	oval = private->stereo_switch[index];
+	val = !!ucontrol->value.integer.value[0];
+
+	if (oval == val)
+		goto unlock;
+	
+	/* Check that the software configuration area is present */
+	if (private->sw_cfg == NULL)
+	{
+		err = -EINVAL;
+		goto unlock;
+	}
+	
+	/* For migrating from mono to stereo we need to to couple of changes:
+	 * 1. Set the routing of two output ports that are grouped into the stereo pair.
+	 * 2. The input port should match to output ports: Odd inputs should match odd outputs and vice verse
+	 */
+	output_number = index << 1;
+	mask = le32_to_cpu(private->sw_cfg->stereo_sw);
+
+	usb_audio_info(mixer->chip, ">>>scarlett2_stereo_mode_ctl_put oval=%d, val=%d, output_number=%d, mask=0x%x",
+				   oval, val, output_number, (int)mask);	
+
+	if (val) {
+		mask |= ((u32)3) << output_number;
+		usb_audio_info(mixer->chip, "  updated mask=0x%x", (int)mask);
+		
+		/* Check the routing settings and update routing if they have been changed */
+		input_number[0] = private->mux[output_number + 0];
+		input_number[1] = private->mux[output_number + 1];
+		
+		usb_audio_info(mixer->chip, "  input_number={%d, %d}", input_number[0], input_number[1]);
+		
+		if (scarlett2_mux_enum_to_drv_port_number(&port_type, &port_num, private->info, SCARLETT2_PORT_IN, input_number[0])) {
+			new_port_num[0] = port_num & (~1);
+			new_port_num[1] = (port_type != SCARLETT2_PORT_TYPE_NONE) ? new_port_num[0] + 1 : new_port_num[0];
+			
+			new_input_number[0] = scarlett2_drv_port_number_to_mux_enum(SCARLETT2_PORT_IN, port_type, new_port_num[0], private->info);
+			new_input_number[1] = scarlett2_drv_port_number_to_mux_enum(SCARLETT2_PORT_IN, port_type, new_port_num[1], private->info);
+			
+			usb_audio_info(mixer->chip, "  new_input_number={%d, %d}", new_input_number[0], new_input_number[1]);
+			
+			/* The routing settins have changed, we need to update the routing and notify the client software */
+			if ((new_input_number[0] != input_number[0]) ||
+				(new_input_number[1] != input_number[1])) {
+				
+				/* Update the device's internal mux state */
+				err = scarlett2_mux_commit_route(mixer, output_number + 0, new_input_number[0]);
+				if (err < 0)
+					goto unlock;
+				err = scarlett2_mux_commit_route(mixer, output_number + 1, new_input_number[1]);
+				if (err < 0)
+					goto unlock;
+				err = scarlett2_usb_set_mux(mixer);
+				if (err < 0)
+					goto unlock;
+				
+				/* Notify the mixer software about the routing changes */
+				snd_ctl_notify(card,
+					SNDRV_CTL_EVENT_MASK_VALUE | SNDRV_CTL_EVENT_MASK_INFO,
+					&private->mux_ctls[output_number + 0]->id);
+				snd_ctl_notify(card,
+					SNDRV_CTL_EVENT_MASK_VALUE | SNDRV_CTL_EVENT_MASK_INFO,
+					&private->mux_ctls[output_number + 1]->id);
+			}
+		}
+	}
+	else {
+		/* For stereo -> mono switch there are no exra things to do except resetting the stereo mask */
+		mask &= ((u32)3) << output_number;
+	}
+	
+	/* Update stereo mask */
+	private->sw_cfg->stereo_sw = cpu_to_le32(mask);
+	err = scarlett2_commit_software_config(mixer, &private->sw_cfg->stereo_sw, sizeof(__le32));
+	if (err < 0)
+		goto unlock;
+
+	/* Update the stereo flag */
+	private->stereo_switch[index] = val;
+
+	if (err >= 0)
+		err = 1;
+
+unlock:
+	mutex_unlock(&private->data_mutex);
+	return err;
+}
+
+static const struct snd_kcontrol_new scarlett2_stereo_mode_ctl = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "",
+	.info = snd_ctl_boolean_mono_info,
+	.get  = scarlett2_stereo_mode_ctl_get,
+	.put  = scarlett2_stereo_mode_ctl_put,
+};
+
+
 /*** Phantom Persistence Control ***/
 
 static int scarlett2_phantom_persistence_ctl_get(
@@ -3617,8 +3817,8 @@ static int scarlett2_add_line_out_ctls(struct usb_mixer_interface *mixer)
 	int num_line_out =
 		info->port_count[SCARLETT2_PORT_TYPE_ANALOGUE][SCARLETT2_PORT_OUT];
 	const struct scarlett2_sw_port_mapping *port_mapping = info->sw_port_mapping;
-	int err, i, index;
-	u32 sw_mutes;
+	int err, i, index, stereo_index;
+	u32 sw_mutes, stereo_mask;
 	char s[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
 
 	/* Add R/O HW volume control */
@@ -3691,8 +3891,10 @@ static int scarlett2_add_line_out_ctls(struct usb_mixer_interface *mixer)
 	if (port_mapping) {
 		/* Read state of mutes from software config */
 		sw_mutes = (private->sw_cfg) ? le32_to_cpu(private->sw_cfg->mute_sw) : 0;
+		stereo_mask = (private->sw_cfg) ? le32_to_cpu(private->sw_cfg->stereo_sw) : 0;
 		
-		usb_audio_info(mixer->chip, "Creating mutes: sw_mutes=0x%x port_mapping=%p\n", (int)sw_mutes, port_mapping);
+		usb_audio_info(mixer->chip, "  sw_mutes=0x%x port_mapping=%p\n", (int)sw_mutes, port_mapping);
+		usb_audio_info(mixer->chip, "  stereo_mask=0x%x\n", (int)stereo_mask);
 		
 		for (; port_mapping->type != SCARLETT2_PORT_TYPE_COUNT; ++port_mapping) {
 			/* We process only output ports */
@@ -3722,7 +3924,29 @@ static int scarlett2_add_line_out_ctls(struct usb_mixer_interface *mixer)
 				if (err < 0)
 					return err;
 				
-				usb_audio_info(mixer->chip, "  mute switch %2d: %s\n", index, s);
+				usb_audio_info(mixer->chip, "  mute switch %2d: %s = %d\n", index, s, private->mute_switch[index]);
+				
+				/* Create Stereo Mode Switch for each even output (starting with 0) */
+				if (index & 1) {
+					stereo_index = index >> 1;
+					
+					usb_audio_info(mixer->chip, "  stereo_mask=0x%x\n", (int)stereo_mask);
+					private->stereo_switch[stereo_index] = !! (stereo_mask & (((u32)3) << (stereo_index << 1)));
+					
+					scarlett2_fmt_stereo_output_port_name(s, sizeof(s),
+										port_mapping->type, port_mapping->hw_offset + i - 1,
+										"Stereo Switch");
+					err = scarlett2_add_new_ctl(mixer,
+							&scarlett2_stereo_mode_ctl,
+							stereo_index, 1, s,
+							&private->stereo_ctls[stereo_index]);
+					if (err < 0)
+						return err;
+					
+					usb_audio_info(mixer->chip, "  stereo switch %2d: %s = %d, bits=0x%x\n",
+								   stereo_index, s, private->stereo_switch[stereo_index],
+								  (int)(((u32)3) << (stereo_index << 1)));
+				}
 			}
 		}
 	}
@@ -4003,33 +4227,7 @@ static int scarlett2_mux_src_enum_ctl_put(struct snd_kcontrol *kctl,
 	if (oval == val)
 		goto unlock;
 
-	private->mux[index] = val;
-	
-	// Check that software config is present
-	if (private->sw_cfg) {
-		int drv_port_type, drv_port_number;
-		int sw_input_number, sw_output_number;
-		
-		// Obtain the input number
-		scarlett2_mux_enum_to_drv_port_number(&drv_port_type, &drv_port_number,
-								info, SCARLETT2_PORT_IN, val);
-		sw_input_number = scarlett2_get_drv_to_sw_port_mapping(
-				SCARLETT2_PORT_IN, drv_port_type, drv_port_number, info);
-		
-		// Obtain the output number
-		scarlett2_mux_enum_to_drv_port_number(&drv_port_type, &drv_port_number,
-								info, SCARLETT2_PORT_OUT, index);
-		sw_output_number = scarlett2_get_drv_to_sw_port_mapping(
-				SCARLETT2_PORT_OUT, drv_port_type, drv_port_number, info);
-		
-		// Obtain the output number
-		usb_audio_info(mixer->chip, "  sw_cfg->out_mux[%d] = %d", sw_output_number, sw_input_number);
-		if ((sw_output_number >= 0) && (sw_input_number >= 0)) {
-			private->sw_cfg->out_mux[sw_output_number] = sw_input_number;
-			err = scarlett2_commit_software_config(mixer, &private->sw_cfg->out_mux[sw_output_number], sizeof(u8));
-		}
-	}
-	
+	err = scarlett2_mux_commit_route(mixer, index, val);
 	if (err >= 0)
 		err = scarlett2_usb_set_mux(mixer);
 	if (err >= 0)
