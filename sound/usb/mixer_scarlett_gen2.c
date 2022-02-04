@@ -452,7 +452,7 @@ struct scarlett2_sw_cfg {
 	__le32 mixer_mute[SCARLETT2_SW_CONFIG_MIXER_OUTPUTS];               /* +0x1950: Mute settings for mixer inputs */
 	__le32 mixer_solo[SCARLETT2_SW_CONFIG_MIXER_OUTPUTS];               /* +0x1980: Solo settings for mixer inputs */
 	u8 __pad7[0x004a];                                                  /* +0x19b0: ???????? */
-	__le32 mixer_bind;                                                  /* +0x19fa: output to 'custom mix' routing bitmap */
+	__le32 custom_mix;                                                  /* +0x19fa: output to 'custom mix' routing bitmap */
 	u8 __pad8[0x006e];                                                  /* +0x19fe: ???????? */
 	__le32 checksum;                                                    /* +0x1a6c: checksum of the area */
 } __packed;
@@ -1581,10 +1581,11 @@ static int scarlett2_read_software_configs(struct usb_mixer_interface *mixer)
 	if (sw_cfg_size == 0) {
 		usb_audio_info(mixer->chip, "Creating software configuration area for device");
 
-		sw->all_size = cpu_to_le16(sizeof(struct scarlett2_sw_cfg) + 0x0c);
-		sw->magic1   = cpu_to_le16(0x3006);
-		sw->version  = cpu_to_le32(0x5);
-		sw->szof     = cpu_to_le16(sizeof(struct scarlett2_sw_cfg));
+		sw->all_size    = cpu_to_le16(sizeof(struct scarlett2_sw_cfg) + 0x0c);
+		sw->custom_mix  = (u32)-1;
+		sw->magic1      = cpu_to_le16(0x3006);
+		sw->version     = cpu_to_le32(0x5);
+		sw->szof        = cpu_to_le16(sizeof(struct scarlett2_sw_cfg));
 		scarlett2_calc_software_cksum(sw);
 
 		err = scarlett2_usb_set(mixer, SCARLETT2_SW_CONFIG_BASE, sw, sizeof(struct scarlett2_sw_cfg));
@@ -2200,32 +2201,71 @@ static int scarlett2_mux_commit_route(struct usb_mixer_interface *mixer,
 	int err = 0;
 	int drv_port_type, drv_port_number;
 	int sw_input_number, sw_output_number;
+	int stereo_output;
+	u32 custom_mix, custom_mix_mask, new_custom_mix, stereo_sw;
 	
 	/* Check that the routing settings have changed */
 	if (private->mux[output_num] == input_number)
 		return 0;
 	
 	private->mux[output_num] = input_number;
+	usb_audio_info(mixer->chip, "  mux[%d] = %d", output_num, input_number);
 	
-	// Check that software config is present
+	/* Check that software config is present */
 	if (private->sw_cfg) {
-		// Obtain the input number
-		scarlett2_mux_enum_to_drv_port_number(&drv_port_type, &drv_port_number,
-								info, SCARLETT2_PORT_IN, input_number);
-		sw_input_number = scarlett2_get_drv_to_sw_port_mapping(
-				SCARLETT2_PORT_IN, drv_port_type, drv_port_number, info);
+		/* Read the custom mix settings and stereo switches */
+		stereo_sw  = le32_to_cpu(private->sw_cfg->stereo_sw);
+		custom_mix = le32_to_cpu(private->sw_cfg->custom_mix);
+		new_custom_mix = custom_mix;
 		
-		// Obtain the output number
+		/* Obtain the output number */
 		scarlett2_mux_enum_to_drv_port_number(&drv_port_type, &drv_port_number,
 								info, SCARLETT2_PORT_OUT, output_num);
 		sw_output_number = scarlett2_get_drv_to_sw_port_mapping(
 				SCARLETT2_PORT_OUT, drv_port_type, drv_port_number, info);
 		
-		// Obtain the output number
+		stereo_output = sw_output_number & (~1);
+		custom_mix_mask = (stereo_sw & (3 << stereo_output)) ? 3 << stereo_output : 1 << sw_output_number;
+		
+		usb_audio_info(mixer->chip, "  stereo_sw=0x%x, custom_mix=0x%x, sw_output_number=%d, stereo_output=%d, custom_mix_mask=0x%x", 
+			(int)stereo_sw, (int)custom_mix, sw_output_number, stereo_output, (int)custom_mix_mask);
+		
+		/* Obtain the input number */
+		scarlett2_mux_enum_to_drv_port_number(&drv_port_type, &drv_port_number,
+								info, SCARLETT2_PORT_IN, input_number);
+		
+		if (drv_port_type == SCARLETT2_PORT_TYPE_MIX) {
+			sw_input_number = drv_port_number + 1;
+			/* Enable the custom mix in the custom mix mask */
+			new_custom_mix &= ~custom_mix_mask;
+		}
+		else {
+			/* The physical input is routed to the physical output */
+			sw_input_number = scarlett2_get_drv_to_sw_port_mapping(
+					SCARLETT2_PORT_IN, drv_port_type, drv_port_number, info);
+			/* Disable the custom mix in the custom mix mask */
+			new_custom_mix |= custom_mix_mask;
+		}
+		
+		/* Obtain the output number */
 		usb_audio_info(mixer->chip, "  sw_cfg->out_mux[%d] = %d", sw_output_number, sw_input_number);
 		if ((sw_output_number >= 0) && (sw_input_number >= 0)) {
 			private->sw_cfg->out_mux[sw_output_number] = sw_input_number;
 			err = scarlett2_commit_software_config(mixer, &private->sw_cfg->out_mux[sw_output_number], sizeof(u8));
+			if (err < 0)
+				return err;
+		}
+		
+		/* Commit the custom mix mask if it is necessary */
+		if (new_custom_mix != custom_mix) {
+			usb_audio_info(mixer->chip, "  custom_mix: 0x%x -> 0x%x",
+				custom_mix, new_custom_mix
+			);
+
+			private->sw_cfg->custom_mix = cpu_to_le32(new_custom_mix);
+			err = scarlett2_commit_software_config(mixer, &private->sw_cfg->custom_mix, sizeof(u32));
+			if (err < 0)
+				return err;
 		}
 	}
 	
@@ -4210,10 +4250,8 @@ static int scarlett2_mux_src_enum_ctl_put(struct snd_kcontrol *kctl,
 	struct usb_mixer_interface *mixer = elem->head.mixer;
 	struct scarlett2_data *private = mixer->private_data;
 	struct snd_card *card = mixer->chip->card;
-	const struct scarlett2_device_info *info = private->info;
-	const int (*port_count)[SCARLETT2_PORT_DIRNS] = info->port_count;
-	int line_out_count = port_count[SCARLETT2_PORT_TYPE_ANALOGUE][SCARLETT2_PORT_OUT];
-	int none_count = port_count[SCARLETT2_PORT_TYPE_NONE][SCARLETT2_PORT_IN];
+	int line_out_count = private->info->port_count[SCARLETT2_PORT_TYPE_ANALOGUE][SCARLETT2_PORT_OUT];
+	int none_count = private->info->port_count[SCARLETT2_PORT_TYPE_NONE][SCARLETT2_PORT_IN];
 	int i, oval, val[2], delta, err = 0;
 	int index, stereo_group; 
 
@@ -4297,18 +4335,29 @@ static int scarlett2_add_mux_enums(struct usb_mixer_interface *mixer)
 {
 	struct scarlett2_data *private = mixer->private_data;
 	const struct scarlett2_device_info *info = private->info;
-	const int (*port_count)[SCARLETT2_PORT_DIRNS] = info->port_count;
 	int port_type, channel, i;
 	int drv_port_type, drv_port_number, mux_input_number;
 	u8 sw_port_number;
+	u32 custom_mix = 0, stereo_sw = 0, custom_mix_mask;
+	int index, stereo_index;
+	int none_count = private->info->port_count[SCARLETT2_PORT_TYPE_NONE][SCARLETT2_PORT_IN];
 	int err = 0;
 	int mux_updated = 0;
+	
+	/* Read the custom mix mask if it is present */
+	if (private->sw_cfg != NULL) {
+		stereo_sw = le32_to_cpu(private->sw_cfg->stereo_sw);
+		custom_mix = le32_to_cpu(private->sw_cfg->custom_mix);
+	}
+	
+	usb_audio_info(mixer->chip, "stereo_sw=0x%x, custom_mix=0x%x\n",
+				(int)stereo_sw, (int)custom_mix);
 
 	for (i = 0, port_type = 0;
 	     port_type < SCARLETT2_PORT_TYPE_COUNT;
 	     port_type++) {
 		for (channel = 0;
-		     channel < port_count[port_type][SCARLETT2_PORT_OUT];
+		     channel < private->info->port_count[port_type][SCARLETT2_PORT_OUT];
 		     channel++, i++) {
 			char s[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
 			const char *const descr =
@@ -4318,18 +4367,53 @@ static int scarlett2_add_mux_enums(struct usb_mixer_interface *mixer)
 			
 			/* Check that software config is present */
 			if (private->sw_cfg != NULL) {
-				int index = scarlett2_get_drv_to_sw_port_mapping(SCARLETT2_PORT_OUT, port_type, channel, info);
+				/* Convert the driver output number to the FC output number */
+				index = scarlett2_get_drv_to_sw_port_mapping(SCARLETT2_PORT_OUT, port_type, channel, info);
 				if (index >= 0) {
+					/* Convert the driver input to the FC input number
+					 * When the corresponding bit for the custom_mix is set to '0',
+					 * then the mixer assignment should be done.
+					 * Otherwise, the input is assigned to output.
+					 */
 					sw_port_number = private->sw_cfg->out_mux[index];
-					scarlett2_get_sw_to_drv_port_mapping(&drv_port_type, &drv_port_number,
-														info, SCARLETT2_PORT_IN, sw_port_number);
-					mux_input_number = scarlett2_drv_port_number_to_mux_enum(
-						SCARLETT2_PORT_IN, drv_port_type, drv_port_number, info);
-				
-					usb_audio_info(mixer->chip, "SW ROUTING for %d: %d:%d,%d:%d -> %s (%d,%d)\n",
-								i, (int)sw_port_number, drv_port_type, drv_port_number, mux_input_number,
-								s, port_type, channel
-								);
+					stereo_index = index & (~1);
+					
+					usb_audio_info(mixer->chip, "index=%d, stereo_index=%d, sw_port_number=%d, mask=0x%x\n",
+						index, stereo_index, sw_port_number, (3 << stereo_index));
+					
+					custom_mix_mask = 1 << index;
+					if (stereo_sw & (3 << stereo_index)) {
+						sw_port_number = private->sw_cfg->out_mux[stereo_index] + (index & 1);
+						custom_mix_mask = 1 << stereo_index;
+					}
+					
+					usb_audio_info(mixer->chip, "upd sw_port_number=%d\n", sw_port_number);
+					
+					if (custom_mix & custom_mix_mask) {
+						/* The physical input is routed to the physical output */
+						scarlett2_get_sw_to_drv_port_mapping(&drv_port_type, &drv_port_number,
+															info, SCARLETT2_PORT_IN, sw_port_number);
+						mux_input_number = scarlett2_drv_port_number_to_mux_enum(
+							SCARLETT2_PORT_IN, drv_port_type, drv_port_number, info);
+					
+						usb_audio_info(mixer->chip, "SW ROUTING for %d: %d:%d,%d:%d -> %s (%d,%d)\n",
+							i, (int)sw_port_number, drv_port_type, drv_port_number, mux_input_number,
+							s, port_type, channel
+						);
+					}
+					else {
+						/* The mixer output is routed to the physical output */
+						mux_input_number = (sw_port_number < none_count)
+							? scarlett2_drv_port_number_to_mux_enum(
+								SCARLETT2_PORT_IN, SCARLETT2_PORT_TYPE_NONE, 0, info)
+							: scarlett2_drv_port_number_to_mux_enum(
+								SCARLETT2_PORT_IN, SCARLETT2_PORT_TYPE_MIX, sw_port_number - 1, info);
+							
+						usb_audio_info(mixer->chip, "MIX ROUTING for %d: %d:%d -> %s (%d,%d)\n",
+							i, (int)sw_port_number, mux_input_number,
+							s, port_type, channel
+						);
+					}
 					
 					/* Change the mux settings if they differ from the hardware ones */
 					usb_audio_info(mixer->chip, "mux[%d] = %d -> %d\n",
