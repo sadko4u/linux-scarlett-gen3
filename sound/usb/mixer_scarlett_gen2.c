@@ -2307,10 +2307,11 @@ static int scarlett2_mux_commit_route(struct usb_mixer_interface *mixer,
 	}
 
 	/* Notify client software about changes */
-	if (err >= 0)
+	if ((err >= 0) && (private->mux_ctls[output_num])) {
 		snd_ctl_notify(card,
 			SNDRV_CTL_EVENT_MASK_VALUE | SNDRV_CTL_EVENT_MASK_INFO,
 			&private->mux_ctls[output_num]->id);
+	}
 	
 	return (err < 0) ? err : 1;
 }
@@ -2367,9 +2368,11 @@ static int scarlett2_mute_ctl_commit(struct usb_mixer_interface *mixer, int mute
 		}
 		
 		/* Notify clients about change and increment number of updated mutes */
-		snd_ctl_notify(card,
-			SNDRV_CTL_EVENT_MASK_VALUE | SNDRV_CTL_EVENT_MASK_INFO,
-			&private->mute_ctls[mute + i]->id);
+		if (private->mute_ctls[mute + i]) {
+			snd_ctl_notify(card,
+				SNDRV_CTL_EVENT_MASK_VALUE | SNDRV_CTL_EVENT_MASK_INFO,
+				&private->mute_ctls[mute + i]->id);
+		}
 		++updated;
 	}
 	
@@ -2380,6 +2383,49 @@ static int scarlett2_mute_ctl_commit(struct usb_mixer_interface *mixer, int mute
 		err = scarlett2_commit_software_config(mixer, &private->sw_cfg->mute_sw, sizeof(__le32));
 	}
 
+	return (err < 0) ? err : updated;
+}
+
+static int scarlett2_set_output_volume(struct usb_mixer_interface *mixer, int output, int volume, int count) {
+	struct scarlett2_data *private = mixer->private_data;
+	struct snd_card *card = mixer->chip->card;
+	int i, index, updated = 0, err = 0;
+	int hw_volume;
+	
+	for (i=0; i<count; ++i) {
+		/* Remap the port number first */
+		index = line_out_remap(private, output + i);
+		
+		/* Check that volume has changed */
+		if (private->vol[index] == volume)
+			continue;
+		
+		/* Update volume and commit to the device */
+		private->vol[index] = volume;
+		hw_volume = volume - SCARLETT2_VOLUME_BIAS;
+		err = scarlett2_usb_set_config(mixer, SCARLETT2_CONFIG_LINE_OUT_VOLUME, index, hw_volume);
+		if (err < 0)
+			return err;
+		
+		/* Update the software configuration */
+		if (private->sw_cfg)
+			private->sw_cfg->volume[output + i].volume = cpu_to_le16((u16)hw_volume);
+		
+		/* Notify clients about change ant increment number of updated volumes */
+		if (private->vol_ctls[output + i]) {
+			snd_ctl_notify(card,
+				SNDRV_CTL_EVENT_MASK_VALUE | SNDRV_CTL_EVENT_MASK_INFO,
+				&private->vol_ctls[output + i]->id);
+		}
+		++updated;
+	}
+	
+	/* Commit software configuration updates if there are changes */
+	if (updated > 0) {
+		err = scarlett2_commit_software_config(mixer, &private->sw_cfg->volume[output],
+			count * sizeof(struct scarlett2_sw_cfg_volume));
+	}
+	
 	return (err < 0) ? err : updated;
 }
 
@@ -2619,24 +2665,25 @@ static int scarlett2_volume_ctl_put(struct snd_kcontrol *kctl,
 	struct usb_mixer_elem_info *elem = kctl->private_data;
 	struct usb_mixer_interface *mixer = elem->head.mixer;
 	struct scarlett2_data *private = mixer->private_data;
-	int index = line_out_remap(private, elem->control);
-	int oval, val, err = 0;
+	int index, stereo_group;
+	int val, err = 0;
 
 	mutex_lock(&private->data_mutex);
-
-	oval = private->vol[index];
+	
+	/* Update single volume or pair of volumes depending on stereo settings */
+	index = elem->control;
+	stereo_group = index >> 1;
 	val = ucontrol->value.integer.value[0];
+	
+	usb_audio_info(mixer->chip, ">>>scarlett2_volume_ctl_put index=%d, stereo_group=%d, val=%d\n", index, stereo_group, val);
+	
+	err = (private->stereo_switch[stereo_group]) ?
+		scarlett2_set_output_volume(mixer, index & (~1), val, 2) :
+		scarlett2_set_output_volume(mixer, index, val, 1);
 
-	if (oval == val)
-		goto unlock;
-
-	private->vol[index] = val;
-	err = scarlett2_usb_set_config(mixer, SCARLETT2_CONFIG_LINE_OUT_VOLUME,
-				       index, val - SCARLETT2_VOLUME_BIAS);
-	if (err == 0)
+	if (err >= 0)
 		err = 1;
 
-unlock:
 	mutex_unlock(&private->data_mutex);
 	return err;
 }
@@ -3193,6 +3240,7 @@ static int scarlett2_stereo_mode_ctl_put(struct snd_kcontrol *kctl,
 	int line_out_count = private->info->port_count[SCARLETT2_PORT_TYPE_ANALOGUE][SCARLETT2_PORT_OUT];
 	int index = elem->control;
 	int i, oval, val, err = 0;
+	int output_volume;
 	int output_number, input_number[2], new_input_number[2];
 	int port_type, port_num, new_port_num[2];
 	u32 stereo_mask;
@@ -3228,6 +3276,14 @@ static int scarlett2_stereo_mode_ctl_put(struct snd_kcontrol *kctl,
 	if (val) {
 		stereo_mask |= ((u32)3) << (index << 1);
 		usb_audio_info(mixer->chip, "  updated stereo_mask=0x%x", (int)stereo_mask);
+		
+		/* Update the volume settings to the lowest one of two for analogue outputs */
+		if (output_number < line_out_count) {
+			output_volume = min(private->vol[output_number + 0], private->vol[output_number + 1]);
+			err = scarlett2_set_output_volume(mixer, index << 1, output_volume, 2);
+			if (err < 0)
+				goto unlock;
+		}
 		
 		/* Check the routing settings and update routing if they have been changed */
 		input_number[0] = private->mux[output_number + 0];
@@ -3918,7 +3974,7 @@ static int scarlett2_add_line_out_ctls(struct usb_mixer_interface *mixer)
 		info->port_count[SCARLETT2_PORT_TYPE_ANALOGUE][SCARLETT2_PORT_OUT];
 	const struct scarlett2_sw_port_mapping *port_mapping = info->sw_port_mapping;
 	int err, i, index, hw_index, stereo_index, output_index;
-	int stereo_switch;
+	int stereo_switch, volumes[2];
 	u32 sw_mutes, stereo_mask;
 	char s[SNDRV_CTL_ELEM_ID_NAME_MAXLEN];
 
@@ -3932,25 +3988,9 @@ static int scarlett2_add_line_out_ctls(struct usb_mixer_interface *mixer)
 			return err;
 	}
 
-	/* Add volume controls */
+	/* Add other volume controls */
 	for (i = 0; i < num_line_out; i++) {
 		index = line_out_remap(private, i);
-
-		/* Fader */
-		if (info->line_out_descrs[i])
-			snprintf(s, sizeof(s),
-				 "Line %02d (%s) Playback Volume",
-				 i + 1, info->line_out_descrs[i]);
-		else
-			snprintf(s, sizeof(s),
-				 "Line %02d Playback Volume",
-				 i + 1);
-		err = scarlett2_add_new_ctl(mixer,
-					    &scarlett2_line_out_volume_ctl,
-					    i, 1, s, &private->vol_ctls[i]);
-		if (err < 0)
-			return err;
-
 		/* Make the fader and mute controls read-only if the
 		 * SW/HW switch is set to HW
 		 */
@@ -4059,6 +4099,42 @@ static int scarlett2_add_line_out_ctls(struct usb_mixer_interface *mixer)
 				}
 			}
 		}
+	}
+	
+	/* Add output volume faders */
+	for (i = 0; i < num_line_out; i++) {
+		/* Apply the software volume settings */
+		if (private->sw_cfg) {
+			stereo_index = i >> 1;
+			if (private->stereo_switch[stereo_index]) {
+				output_index = stereo_index << 1;
+				volumes[0] = le16_to_cpu(private->sw_cfg->volume[output_index + 0].volume) + SCARLETT2_VOLUME_BIAS;
+				volumes[1] = le16_to_cpu(private->sw_cfg->volume[output_index + 1].volume) + SCARLETT2_VOLUME_BIAS;
+				volumes[0] = min(volumes[0], volumes[1]);
+			}
+			else
+				volumes[0] = le16_to_cpu(private->sw_cfg->volume[i].volume) + SCARLETT2_VOLUME_BIAS;
+			
+			/* Adjust the output volume */
+			err = scarlett2_set_output_volume(mixer, i, min(volumes[0], volumes[1]), 1);
+			if (err < 0)
+				return err;
+		}
+
+		/* Add the volume control */
+		if (info->line_out_descrs[i])
+			snprintf(s, sizeof(s),
+				 "Line %02d (%s) Playback Volume",
+				 i + 1, info->line_out_descrs[i]);
+		else
+			snprintf(s, sizeof(s),
+				 "Line %02d Playback Volume",
+				 i + 1);
+		err = scarlett2_add_new_ctl(mixer,
+					    &scarlett2_line_out_volume_ctl,
+					    i, 1, s, &private->vol_ctls[i]);
+		if (err < 0)
+			return err;
 	}
 
 	return 0;
